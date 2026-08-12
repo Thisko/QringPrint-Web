@@ -1,0 +1,15 @@
+{
+  "name": "qringprint-h5",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Qring / 小印 58mm 蓝牙热敏打印机的纯 Web 客户端（Web Bluetooth + Web Serial）",
+  "scripts": {
+    "dev": "node serve.js",
+    "preview": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.120.1"
+  }
+}

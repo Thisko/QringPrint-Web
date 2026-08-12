@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Qring 打印机 传输通道探针 v2</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; padding: 16px 16px calc(24px + env(safe-area-inset-bottom));
+    background: #12141a; color: #e6e8ee;
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Microsoft YaHei", sans-serif;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 13px; margin: 18px 0 8px; color: #8b91a3; font-weight: 600;
+       letter-spacing: .04em; }
+  .sub { color: #8b91a3; font-size: 13px; margin-bottom: 4px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  button, select {
+    flex: 1 1 auto; min-width: 120px; padding: 11px 13px;
+    border: 0; border-radius: 10px; background: #2f6df6; color: #fff;
+    font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  button.ghost { background: #262a36; color: #c3c8d6; }
+  button.warn  { background: #b45309; }
+  button:disabled { opacity: .4; cursor: default; }
+  select { background: #262a36; color: #c3c8d6; font-weight: 400;
+           font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+           flex: 1 1 100%; }
+  #log {
+    margin-top: 12px;
+    background: #0b0d12; border: 1px solid #232735; border-radius: 10px;
+    padding: 12px; min-height: 300px; max-height: 55vh; overflow: auto;
+    font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  .ok { color: #4ade80; } .bad { color: #f87171; }
+  .warn2 { color: #fbbf24; } .dim { color: #6b7280; }
+  .hi { color: #60a5fa; font-weight: 700; } .rx { color: #c084fc; }
+</style>
+</head>
+<body>
+
+<h1>Qring 打印机 · 传输通道探针 v2</h1>
+<div class="sub">
+  每个候选通道都试；发查询前先按 Python 的 <code>enable → wakeup</code> 唤醒。<br>
+  查询无响应也别急着下结论 —— 以「走纸测试」是否出纸为准。
+</div>
+
+<h2>BLE（三端通用）</h2>
+<div class="row"><button id="bleScan">连接并扫描全部通道</button></div>
+<div class="row"><select id="bleCh" disabled><option>（未连接）</option></select></div>
+<div class="row">
+  <button id="bleQuery" class="ghost" disabled>协议问答</button>
+  <button id="bleSniff" class="ghost" disabled>监听 10 秒</button>
+  <button id="bleFeed"  class="warn"  disabled>走纸测试（会出纸）</button>
+</div>
+<div class="row"><button id="bleAll" class="ghost" disabled>逐个通道全试一遍</button>
+                <button id="bleOff" class="ghost" disabled>断开</button></div>
+
+<h2>串口（仅桌面，走系统蓝牙 COM 口）</h2>
+<div class="row"><button id="serOpen" class="ghost">打开串口</button></div>
+<div class="row">
+  <button id="serQuery" class="ghost" disabled>协议问答</button>
+  <button id="serSniff" class="ghost" disabled>监听 10 秒</button>
+  <button id="serFeed"  class="warn"  disabled>走纸测试（会出纸）</button>
+  <button id="serOff"   class="ghost" disabled>关闭</button>
+</div>
+
+<div class="row" style="margin-top:12px">
+  <button id="btnCopy" class="ghost">复制日志</button>
+  <button id="btnClear" class="ghost">清空</button>
+</div>
+
+<div id="log"></div>
+
+<script>
+/* ==========================================================================
+   Qring 私有协议 —— 全部照抄 qring-spp.py
+   ========================================================================== */
+const CMD_ENABLE  = Uint8Array.of(0x10, 0xFF, 0xF1, 0x02);
+const CMD_ENABLE2 = Uint8Array.of(0x1F, 0xB2, 0x10);
+const CMD_STOP    = Uint8Array.of(0x10, 0xFF, 0xF1, 0x45);
+const CMD_WAKEUP  = new Uint8Array(12);                     // 12 × 0x00
+const CMD_MODEL   = Uint8Array.of(0x10, 0xFF, 0x20, 0xF0);
+const CMD_FW      = Uint8Array.of(0x10, 0xFF, 0x20, 0xF1);
+const CMD_SN      = Uint8Array.of(0x10, 0xFF, 0x20, 0xF2);
+const CMD_STATUS  = Uint8Array.of(0x10, 0xFF, 0x40);
+const CMD_BATTERY = Uint8Array.of(0x10, 0xFF, 0x50, 0xF1);
+const CMD_INFO    = Uint8Array.of(0x10, 0xFF, 0x70);
+const CMD_BT_NAME = Uint8Array.of(0x10, 0xFF, 0x30, 0x11);
+const feedCmd = n => Uint8Array.of(0x1B, 0x4A, n);          // ESC J n
+
+const STATUS_BITS = [
+  [0x01, '正在打印'], [0x02, '机身异常/开盖'], [0x04, '缺纸'],
+  [0x08, '电池电压低'], [0x10, '过热'],
+];
+const UNSOLICITED = { 0x01: '缺纸', 0x02: '开盖', 0x03: '过热', 0x04: '低电量' };
+
+const CANDIDATE_SERVICES = [
+  '49535343-fe7d-4ae5-8fa9-9fafd205e455', // Microchip / ISSC 透传（本机有）
+  '0000ff00-0000-1000-8000-00805f9b34fb', // 本机有，ff02 写 / ff01+ff03 通知
+  '000018f0-0000-1000-8000-00805f9b34fb',
+  '0000ffe0-0000-1000-8000-00805f9b34fb',
+  '0000ffe5-0000-1000-8000-00805f9b34fb',
+  '0000fff0-0000-1000-8000-00805f9b34fb',
+  '0000fee7-0000-1000-8000-00805f9b34fb',
+  '0000ff80-0000-1000-8000-00805f9b34fb',
+  '0000ffb0-0000-1000-8000-00805f9b34fb',
+  '0000abf0-0000-1000-8000-00805f9b34fb',
+  '6e400001-b5a3-f393-e0a9-e50e24dcca9e',
+  'e7810a71-73ae-499d-8c15-faa9aef0c3f2',
+  '0000180a-0000-1000-8000-00805f9b34fb',
+  '0000180f-0000-1000-8000-00805f9b34fb',
+];
+
+/* ==========================================================================
+   工具
+   ========================================================================== */
+const logEl = document.getElementById('log');
+const $ = id => document.getElementById(id);
+function log(msg = '', cls = '') {
+  const d = document.createElement('div');
+  if (cls) d.className = cls;
+  d.textContent = msg;
+  logEl.appendChild(d);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+const hex = u8 => [...u8].map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(' ');
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const short = uuid => /^0000([0-9a-f]{4})-0000-1000-8000-00805f9b34fb$/.test(uuid)
+  ? uuid.slice(4, 8).toUpperCase() : uuid;
+function decodeText(u8) {
+  try { return new TextDecoder('gb18030').decode(u8).replace(/\0+$/, '').trim(); }
+  catch { return new TextDecoder().decode(u8).replace(/\0+$/, '').trim(); }
+}
+
+/* ==========================================================================
+   会话：统一抽象，BLE 和串口共用同一套测试流程
+   session = { name, write(u8), rx:[], clearRx(), chunk }
+   ========================================================================== */
+async function sendChunked(sess, data) {
+  for (let off = 0; off < data.length; off += sess.chunk) {
+    await sess.write(data.subarray(off, off + sess.chunk));
+    await sleep(4);
+  }
+}
+
+/** Python print_image 的前置：enable(两条) + wakeup */
+async function wakeSequence(sess) {
+  await sendChunked(sess, CMD_ENABLE);
+  await sendChunked(sess, CMD_ENABLE2);
+  await sendChunked(sess, CMD_WAKEUP);
+  await sleep(120);
+}
+
+async function query(sess, cmd, waitMs = 1200) {
+  sess.clearRx();
+  await sendChunked(sess, cmd);
+  await sleep(waitMs);
+  return Uint8Array.from(sess.rx);
+}
+
+async function runProtocolTest(sess) {
+  log();
+  log(`── 协议问答 @ ${sess.name} ─────────────────`, 'hi');
+  log('先发 enable + wakeup 唤醒…', 'dim');
+  await wakeSequence(sess);
+
+  const tests = [
+    ['查型号    10 FF 20 F0', CMD_MODEL,   'str'],
+    ['查固件    10 FF 20 F1', CMD_FW,      'str'],
+    ['查序列号  10 FF 20 F2', CMD_SN,      'str'],
+    ['查蓝牙名  10 FF 30 11', CMD_BT_NAME, 'str'],
+    ['查状态    10 FF 40   ', CMD_STATUS,  'status'],
+    ['查电量    10 FF 50 F1', CMD_BATTERY, 'battery'],
+    ['查信息    10 FF 70   ', CMD_INFO,    'str'],
+  ];
+
+  let hits = 0;
+  for (const [name, cmd, kind] of tests) {
+    const r = await query(sess, cmd);
+    if (!r.length) { log(`${name}  →  (无响应)`, 'dim'); continue; }
+    hits++;
+    log(`${name}  →  ${hex(r)}`, 'ok');
+    if (kind === 'str') {
+      const s = decodeText(r);
+      if (s) log(`${' '.repeat(name.length)}      "${s}"`, 'ok');
+    } else if (kind === 'status') {
+      const b = r[0];
+      const p = STATUS_BITS.filter(([m]) => b & m).map(([, s]) => s);
+      log(`${' '.repeat(name.length)}      ${b === 0 ? '正常' : p.join(', ') || '未知位'}`, 'ok');
+    } else if (kind === 'battery' && r.length >= 2) {
+      log(`${' '.repeat(name.length)}      ${r[1]}%`, 'ok');
+    }
+  }
+
+  log();
+  log(hits ? `*** ${sess.name}：${hits}/${tests.length} 条有响应，查询通道可用 ***`
+           : `*** ${sess.name}：查询全无响应 ***`,
+      hits ? 'ok' : 'warn2');
+  if (!hits) log('→ 别急着否掉这条通道，接着跑「走纸测试」看能不能出纸。', 'warn2');
+  return hits;
+}
+
+/** 决定性验证：能出纸 = 这条通道能打印，与查询通道死活无关 */
+async function runFeedTest(sess, dots = 80) {
+  log();
+  log(`── 走纸测试 @ ${sess.name} ─────────────────`, 'hi');
+  log('时序：enable → enable2 → wakeup → ESC J 80 → stop', 'dim');
+  sess.clearRx();
+  await sendChunked(sess, CMD_ENABLE);
+  await sendChunked(sess, CMD_ENABLE2);
+  await sendChunked(sess, CMD_WAKEUP);
+  await sleep(100);
+  await sendChunked(sess, feedCmd(dots));
+  await sleep(100);
+  await sendChunked(sess, CMD_STOP);
+  await sleep(1500);
+  const r = Uint8Array.from(sess.rx);
+  if (r.length) log(`收到回包: ${hex(r)}`, 'ok');
+  log('已发送。**请看打印机有没有吐纸** —— 出纸就说明这条通道通了。', 'warn2');
+}
+
+/** 只测接收方向：期间开合上盖，机器应主动上报 FF 01 / FF 02 */
+async function runSniff(sess, ms = 10000) {
+  log();
+  log(`── 监听 ${ms / 1000}s @ ${sess.name} ─────────────────`, 'hi');
+  log('请在这 10 秒内**开合一次纸仓上盖**（机器会主动上报 FF 01/02）', 'warn2');
+  sess.clearRx();
+  const t0 = performance.now();
+  let seen = 0;
+  while (performance.now() - t0 < ms) {
+    await sleep(300);
+    if (sess.rx.length > seen) {
+      const chunk = Uint8Array.from(sess.rx.slice(seen));
+      seen = sess.rx.length;
+      log(`  RX ${hex(chunk)}`, 'rx');
+      for (let i = 0; i < chunk.length - 1; i++)
+        if (chunk[i] === 0xFF && UNSOLICITED[chunk[i + 1]])
+          log(`     → 故障帧: ${UNSOLICITED[chunk[i + 1]]}`, 'warn2');
+    }
+  }
+  log(seen ? `*** 收到 ${seen} 字节 —— 接收方向是通的 ***`
+           : '*** 10 秒内一个字节都没收到 —— 接收方向不通（或没开合上盖）***',
+      seen ? 'ok' : 'warn2');
+}
+
+/* ==========================================================================
+   BLE
+   ========================================================================== */
+const ble = { device: null, server: null, channels: [], rx: [] };
+
+function bleUI(on) {
+  for (const id of ['bleQuery', 'bleSniff', 'bleFeed', 'bleAll', 'bleOff', 'bleCh'])
+    $(id).disabled = !on;
+}
+
+function bleSession(chIdx) {
+  const ch = ble.channels[chIdx];
+  const c = ch.write;
+  const noResp = c.properties.writeWithoutResponse &&
+                 typeof c.writeValueWithoutResponse === 'function';
+  return {
+    name: `BLE ${short(ch.service)} / 写 ${short(c.uuid)}`,
+    rx: ble.rx,
+    clearRx: () => { ble.rx.length = 0; },
+    chunk: 20,                                  // 保守取默认 MTU，探针阶段求稳
+    write: u8 => noResp ? c.writeValueWithoutResponse(u8) : c.writeValue(u8),
+  };
+}
+
+$('bleScan').addEventListener('click', async () => {
+  if (!navigator.bluetooth) return log('本浏览器没有 Web Bluetooth。', 'bad');
+  if (!window.isSecureContext)
+    return log('非安全上下文，API 被禁用。需要 https:// 或 http://localhost', 'bad');
+
+  try {
+    ble.device = await navigator.bluetooth.requestDevice({
+      acceptAllDevices: true, optionalServices: CANDIDATE_SERVICES,
+    });
+  } catch (e) { return log(`未选择设备：${e.message}`, 'warn2'); }
+
+  log();
+  log('═══ BLE 扫描 ═══════════════════════════', 'hi');
+  log(`设备: ${ble.device.name || '(无名)'}`);
+
+  try { ble.server = await ble.device.gatt.connect(); log('GATT 已连接', 'ok'); }
+  catch (e) { return log(`GATT 连接失败：${e.message}`, 'bad'); }
+
+  ble.channels = []; ble.rx.length = 0;
+  const services = await ble.server.getPrimaryServices();
+
+  for (const svc of services) {
+    let chars = [];
+    try { chars = await svc.getCharacteristics(); } catch { continue; }
+    const writes  = chars.filter(c => c.properties.write || c.properties.writeWithoutResponse);
+    const notifys = chars.filter(c => c.properties.notify || c.properties.indicate);
+    if (!writes.length && !notifys.length) continue;
+
+    log();
+    log(`Service ${svc.uuid}`, 'hi');
+    for (const c of chars) {
+      const p = c.properties;
+      const f = [p.read && 'read', p.write && 'write',
+                 p.writeWithoutResponse && 'writeNoResp',
+                 p.notify && 'notify', p.indicate && 'indicate'].filter(Boolean);
+      log(`  ├─ ${c.uuid}  [${f.join(', ')}]`);
+    }
+
+    // 这个 service 下所有通知特征全订阅 —— ff00 有 ff01/ff03 两个，
+    // 上一版只订第一个，回包走另一个就整个漏掉了
+    for (const n of notifys) {
+      try {
+        await n.startNotifications();
+        n.addEventListener('characteristicvaluechanged', e => {
+          const v = new Uint8Array(e.target.value.buffer);
+          for (const b of v) ble.rx.push(b);
+          log(`  RX[${short(n.uuid)}] ${hex(v)}`, 'rx');
+        });
+        log(`  ✓ 已订阅 ${short(n.uuid)}`, 'ok');
+      } catch (e) { log(`  ✗ 订阅 ${short(n.uuid)} 失败: ${e.message}`, 'bad'); }
+    }
+
+    // 每个可写特征都作为独立候选通道
+    for (const w of writes) ble.channels.push({ service: svc.uuid, write: w });
+  }
+
+  const sel = $('bleCh');
+  sel.innerHTML = '';
+  ble.channels.forEach((ch, i) => {
+    const o = document.createElement('option');
+    o.value = i;
+    o.textContent = `#${i}  ${short(ch.service)}  →  写 ${short(ch.write.uuid)}`;
+    sel.appendChild(o);
+  });
+
+  log();
+  log(`共 ${ble.channels.length} 个候选写通道，已在下拉框列出。`, 'hi');
+  log('建议顺序：先「逐个通道全试一遍」，再对可疑通道单独跑「走纸测试」。', 'dim');
+  bleUI(ble.channels.length > 0);
+});
+
+$('bleQuery').addEventListener('click', () => runProtocolTest(bleSession(+$('bleCh').value)));
+$('bleSniff').addEventListener('click', () => runSniff(bleSession(+$('bleCh').value)));
+$('bleFeed') .addEventListener('click', () => runFeedTest(bleSession(+$('bleCh').value)));
+
+$('bleAll').addEventListener('click', async () => {
+  for (let i = 0; i < ble.channels.length; i++) {
+    log();
+    log(`━━━ 通道 #${i} ━━━━━━━━━━━━━━━━━━━━━━━━`, 'hi');
+    try { await runProtocolTest(bleSession(i)); }
+    catch (e) { log(`写入失败：${e.message}`, 'bad'); }
+  }
+  log();
+  log('全部通道试完。若都没响应，请对 #0 和 #1 分别跑一次「走纸测试」。', 'warn2');
+});
+
+$('bleOff').addEventListener('click', () => {
+  ble.device?.gatt?.disconnect();
+  bleUI(false);
+  log('已断开 BLE。', 'dim');
+});
+
+/* ==========================================================================
+   串口
+   ========================================================================== */
+const ser = { port: null, reader: null, writer: null, rx: [] };
+const serSession = () => ({
+  name: '串口', rx: ser.rx, clearRx: () => { ser.rx.length = 0; },
+  chunk: 1024, write: u8 => ser.writer.write(u8),
+});
+function serUI(on) {
+  for (const id of ['serQuery', 'serSniff', 'serFeed', 'serOff']) $(id).disabled = !on;
+  $('serOpen').disabled = on;
+}
+
+$('serOpen').addEventListener('click', async () => {
+  if (!navigator.serial) return log('本浏览器没有 Web Serial（桌面 Chrome/Edge 才有）。', 'bad');
+  try {
+    ser.port = await navigator.serial.requestPort();
+    await ser.port.open({ baudRate: 115200 });
+  } catch (e) { return log(`打开串口失败：${e.message}`, 'bad'); }
+
+  log();
+  log('═══ 串口已打开 115200 8N1 ═══════════════', 'hi');
+  log('注意：蓝牙配对会生成「传出」和「传入」两个 COM 口，', 'warn2');
+  log('      只有「传出」那个能用。没响应就换另一个试。', 'warn2');
+
+  ser.rx.length = 0;
+  ser.writer = ser.port.writable.getWriter();
+  ser.reader = ser.port.readable.getReader();
+  (async () => {
+    try {
+      for (;;) {
+        const { value, done } = await ser.reader.read();
+        if (done) break;
+        if (value?.length) {
+          for (const b of value) ser.rx.push(b);
+          log(`  RX ${hex(value)}`, 'rx');
+        }
+      }
+    } catch { /* 断开 */ }
+  })();
+  serUI(true);
+});
+
+$('serQuery').addEventListener('click', () => runProtocolTest(serSession()));
+$('serSniff').addEventListener('click', () => runSniff(serSession()));
+$('serFeed') .addEventListener('click', () => runFeedTest(serSession()));
+$('serOff').addEventListener('click', async () => {
+  try {
+    await ser.reader.cancel(); ser.writer.releaseLock(); await ser.port.close();
+    log('串口已关闭。', 'dim');
+  } catch (e) { log(`关闭出错: ${e.message}`, 'bad'); }
+  serUI(false);
+});
+
+/* ==========================================================================
+   杂项
+   ========================================================================== */
+$('btnCopy').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(logEl.innerText); log('— 已复制 —', 'ok'); }
+  catch { log('复制失败，请手动全选。', 'warn2'); }
+});
+$('btnClear').addEventListener('click', () => { logEl.textContent = ''; env(); });
+
+function env() {
+  log(`UA: ${navigator.userAgent}`, 'dim');
+  log(`安全上下文 ${window.isSecureContext} | WebBluetooth ${!!navigator.bluetooth}` +
+      ` | WebSerial ${!!navigator.serial}`, 'dim');
+  log('─'.repeat(44), 'dim');
+}
+env();
+serUI(false); bleUI(false);
+</script>
+</body>
+</html>
