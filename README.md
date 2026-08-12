@@ -6,7 +6,7 @@
 
 ![Platform](https://img.shields.io/badge/platform-Web-black) ![API](https://img.shields.io/badge/Web%20Bluetooth%20%2F%20Web%20Serial-2f6df6) ![Deps](https://img.shields.io/badge/dependencies-0-green) ![Device](https://img.shields.io/badge/device-58mm%20%E7%83%AD%E6%95%8F%E6%89%93%E5%8D%B0%E6%9C%BA-7C5CE6) ![License](https://img.shields.io/badge/license-MIT-green)
 
-**在线使用 → <https://https://qp.thisko.cc.cd/>**
+**在线使用 → <https://qp.thisko.cc.cd/>**
 
 ---
 
