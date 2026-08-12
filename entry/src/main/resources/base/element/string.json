@@ -1,0 +1,28 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "module description"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "entry ability description"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "QringPrint"
+    },
+    {
+      "name": "bluetooth_reason",
+      "value": "用于连接蓝牙打印机进行打印操作"
+    },
+    {
+      "name": "bluetooth_discover_reason",
+      "value": "用于扫描发现附近的蓝牙打印机设备"
+    },
+    {
+      "name": "bluetooth_use_reason",
+      "value": "用于使用蓝牙功能进行数据传输"
+    }
+  ]
+}
